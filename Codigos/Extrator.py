@@ -1,10 +1,12 @@
 import ftplib
 import os
 import io
-import py7zr # Nova biblioteca
+import py7zr
 import pandas as pd
 import logging
-from datetime import datetime # Para obter o ano/mês atual
+import tempfile
+import shutil
+from datetime import datetime
 
 # Configurar logging para melhor visibilidade
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -14,10 +16,6 @@ def get_ftp_file_list(ftp_conn):
     try:
         return ftp_conn.nlst()
     except ftplib.error_perm as e:
-        # Se nlst falhar (ex: diretório vazio ou permissão negada), tentar list().
-        # list() retorna detalhes que precisam ser parseados para nomes de arquivos/dir.
-        # Para simplificação, vamos assumir que nlst() funciona para diretórios com conteúdo ou vazios.
-        # Para um ambiente de produção mais robusto, um parsing de ftp_conn.dir() seria necessário.
         logging.warning(f"nlst() falhou. Tentando list() para depuração se necessário: {e}")
         return []
 
@@ -47,7 +45,7 @@ def extract_from_ftp_with_7z(ftp_host, base_ftp_path, download_dir='dados_caged_
     all_dataframes = {}
 
     try:
-        with ftplib.FTP(ftp_host) as ftp:
+        with ftplib.FTP(ftp_host, encoding='latin-1') as ftp:
             logging.info(f"Conectando a {ftp_host}...")
             ftp.login() # Login anônimo
             logging.info("Login FTP realizado com sucesso.")
@@ -61,12 +59,16 @@ def extract_from_ftp_with_7z(ftp_host, base_ftp_path, download_dir='dados_caged_
                 return {}
 
             # Listar anos (ex: '2024', '2025')
-            year_dirs = [d for d in get_ftp_file_list(ftp) if d.isdigit() and len(d) == 4]
-            logging.info(f"Anos encontrados: {year_dirs}")
+            year_dirs = [d for d in get_ftp_file_list(ftp) if d.isdigit() and len(d) == 4 and d in ['2024', '2025']]
+            logging.info(f"Anos encontrados (filtrados para 2024 e 2025): {year_dirs}")
 
             for year in sorted(year_dirs): # Processar anos em ordem
-                ftp.cwd(year) # Entra na pasta do ano
-                logging.info(f"Navegou para o ano: {year}")
+                try:
+                    ftp.cwd(year) # Entra na pasta do ano
+                    logging.info(f"Navegou para o ano: {year}")
+                except ftplib.error_perm as e:
+                    logging.warning(f"Não foi possível entrar no diretório do ano '{year}': {e}. Pulando este ano.")
+                    continue
 
                 # Listar meses (ex: '202401', '202402')
                 month_dirs = [d for d in get_ftp_file_list(ftp) if d.isdigit() and len(d) == 6 and d.startswith(year)]
@@ -80,7 +82,11 @@ def extract_from_ftp_with_7z(ftp_host, base_ftp_path, download_dir='dados_caged_
                         continue
 
                     logging.info(f"Processando nova pasta: {full_month_path_id}")
-                    ftp.cwd(month_folder) # Entra na pasta do mês
+                    try:
+                        ftp.cwd(month_folder) # Entra na pasta do mês
+                    except ftplib.error_perm as e:
+                        logging.warning(f"Não foi possível entrar no diretório do mês '{month_folder}': {e}. Pulando este mês.")
+                        continue
 
                     # Listar arquivos .7z dentro da pasta do mês
                     sevenz_files = [f for f in get_ftp_file_list(ftp) if f.lower().endswith('.7z')]
@@ -96,38 +102,50 @@ def extract_from_ftp_with_7z(ftp_host, base_ftp_path, download_dir='dados_caged_
 
                         # Extrair e processar o arquivo .7z
                         try:
-                            with py7zr.SevenZipFile(local_sevenz_filepath, mode='r') as archive:
-                                # Lista os nomes dos arquivos dentro do .7z
-                                inner_filenames = archive.getnames()
+                            # Criar diretório temporário para extração
+                            with tempfile.TemporaryDirectory() as temp_extract_dir:
+                                logging.info(f"Extraindo '{sevenz_filename}' para diretório temporário...")
                                 
-                                for inner_file_name in inner_filenames:
-                                    if inner_file_name.lower().endswith('.csv') or inner_file_name.lower().endswith('.txt'):
-                                        logging.info(f"Lendo '{inner_file_name}' de dentro de '{sevenz_filename}'.")
+                                # --- NOVA ABORDAGEM: Usar extractall() ---
+                                with py7zr.SevenZipFile(local_sevenz_filepath, mode='r') as archive:
+                                    archive.extractall(path=temp_extract_dir)
+                                
+                                logging.info(f"Extração de '{sevenz_filename}' concluída.")
+                                
+                                # Listar arquivos extraídos
+                                extracted_files = os.listdir(temp_extract_dir)
+                                logging.info(f"Arquivos extraídos: {extracted_files}")
+                                
+                                # Processar arquivos CSV/TXT extraídos
+                                for extracted_file in extracted_files:
+                                    if extracted_file.lower().endswith('.csv') or extracted_file.lower().endswith('.txt'):
+                                        extracted_file_path = os.path.join(temp_extract_dir, extracted_file)
+                                        logging.info(f"Lendo '{extracted_file}' do diretório temporário.")
                                         
-                                        # Abre o arquivo de dentro do 7z para leitura como bytes
-                                        with archive.open(inner_file_name) as member_file:
-                                            # Envolve o stream de bytes com TextIOWrapper para ler como texto
-                                            content = io.TextIOWrapper(member_file, encoding='utf-8')
-                                            
+                                        try:
+                                            # Tenta ler com ';' e 'latin1'
+                                            df_temp = pd.read_csv(extracted_file_path, sep=';', encoding='latin1', on_bad_lines='skip')
+                                            all_dataframes[f"{month_folder}_{extracted_file}"] = df_temp
+                                            logging.info(f"DataFrame para '{extracted_file}' (de '{sevenz_filename}') criado com sucesso (latin1, sep=';').")
+                                        except Exception as e:
+                                            logging.warning(f"Erro ao ler CSV/TXT '{extracted_file}' com latin1 e sep=';': {e}. Tentando 'utf-8' e sep=','.")
                                             try:
-                                                # Tenta ler com ';' e 'utf-8'
-                                                df_temp = pd.read_csv(content, sep=';', encoding='utf-8', on_bad_lines='skip')
-                                                all_dataframes[f"{month_folder}_{inner_file_name}"] = df_temp
-                                                logging.info(f"DataFrame para '{inner_file_name}' (de '{sevenz_filename}') criado com sucesso (UTF-8, sep=';').")
-                                            except Exception as e:
-                                                logging.warning(f"Erro ao ler CSV/TXT '{inner_file_name}' com UTF-8 e sep=';': {e}. Tentando 'latin1' e sep=','. (ou outros padrões do CAGED)")
+                                                # Tenta ler com ',' e 'utf-8'
+                                                df_temp = pd.read_csv(extracted_file_path, sep=',', encoding='utf-8', on_bad_lines='skip')
+                                                all_dataframes[f"{month_folder}_{extracted_file}"] = df_temp
+                                                logging.info(f"DataFrame para '{extracted_file}' (de '{sevenz_filename}') criado com sucesso (utf-8, sep=',').")
+                                            except Exception as e_retry:
+                                                logging.warning(f"Tentando com cp1252 e sep=';' para '{extracted_file}'...")
                                                 try:
-                                                    # Resetar o ponteiro do stream se for necessário re-tentar
-                                                    content.seek(0)
-                                                    # Tenta ler com ',' e 'latin1'
-                                                    df_temp = pd.read_csv(content, sep=',', encoding='latin1', on_bad_lines='skip')
-                                                    all_dataframes[f"{month_folder}_{inner_file_name}"] = df_temp
-                                                    logging.info(f"DataFrame para '{inner_file_name}' (de '{sevenz_filename}') criado com sucesso (latin1, sep=',').")
-                                                except Exception as e_retry:
-                                                    logging.error(f"Falha ao ler CSV/TXT '{inner_file_name}' do '{sevenz_filename}' com UTF-8/latin1 e sep=';',sep=',' : {e_retry}. Arquivo ignorado.")
+                                                    # Tenta ler com ';' e 'cp1252' (Windows-1252)
+                                                    df_temp = pd.read_csv(extracted_file_path, sep=';', encoding='cp1252', on_bad_lines='skip')
+                                                    all_dataframes[f"{month_folder}_{extracted_file}"] = df_temp
+                                                    logging.info(f"DataFrame para '{extracted_file}' (de '{sevenz_filename}') criado com sucesso (cp1252, sep=';').")
+                                                except Exception as e_final:
+                                                    logging.error(f"Falha ao ler CSV/TXT '{extracted_file}' do '{sevenz_filename}' com todas as tentativas de codificação: {e_final}. Arquivo ignorado.")
 
                         except Exception as e:
-                            logging.error(f"Erro ao extrair ou processar .7z '{sevenz_filename}': {e}")
+                            logging.error(f"Erro ao extrair ou processar .7z '{sevenz_filename}': {e}", exc_info=True)
                         
                         # Opcional: Remover o arquivo .7z baixado após a extração para economizar espaço
                         # os.remove(local_sevenz_filepath)
@@ -146,15 +164,15 @@ def extract_from_ftp_with_7z(ftp_host, base_ftp_path, download_dir='dados_caged_
     except ftplib.all_errors as e:
         logging.error(f"Erro de FTP: {e}")
     except Exception as e:
-        logging.error(f"Ocorreu um erro inesperado: {e}", exc_info=True) # exc_info=True para logar o traceback
+        logging.error(f"Ocorreu um erro inesperado: {e}", exc_info=True)
     
     return all_dataframes
 
 # --- Exemplo de uso ---
 ftp_host = 'ftp.mtps.gov.br'
 base_ftp_path = 'pdet/microdados/NOVO CAGED/'
-download_directory = 'dados_caged_processados' # Onde os arquivos extraídos (temporariamente) e o .7z serão salvos
-processed_folders_log = 'caged_folders_log.txt' # Arquivo para registrar as pastas já processadas
+download_directory = 'dados_caged_processados'
+processed_folders_log = 'caged_folders_log.txt'
 
 logging.info("Iniciando extração do CAGED...")
 all_caged_dfs = extract_from_ftp_with_7z(ftp_host, base_ftp_path, download_directory, processed_folders_log)
