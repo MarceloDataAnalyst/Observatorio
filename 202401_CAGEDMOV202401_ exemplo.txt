@@ -1,0 +1,2 @@
+competênciamov;região;uf;município;seção;subclasse;saldomovimentação;cbo2002ocupação;categoria;graudeinstrução;idade;horascontratuais;raçacor;sexo;tipoempregador;tipoestabelecimento;tipomovimentação;tipodedeficiência;indtrabintermitente;indtrabparcial;salário;tamestabjan;indicadoraprendiz;origemdainformação;competênciadec;indicadordeforadoprazo;unidadesaláriocódigo;valorsaláriofixo
+202401;2;26;261360;P;8532500;1;411010;101;7;57;54,00;3;1;0;1;97;0;0;0;1800,00;5;0;1;202401;0;5;1800,00
